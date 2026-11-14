@@ -45,9 +45,9 @@
 #include <uuid/uuid.h>
 #include <mach/mach.h>
 #if !TARGET_OS_IPHONE && !defined(_WIN32)
-/* The mach_vm calls are not available on iOS (mach_vm.h says so). The app
- * object is only looked for on the Mac, where the surface's size can change;
- * on the iPad the surface is the game's own size for ever. */
+/* The mach_vm calls are not available on iOS (mach_vm.h says so): there the
+ * older vm_read_overwrite and vm_write read and write the guest's memory (see
+ * guest_read), and the app object is found through the guest's globals. */
 #include <mach/mach_vm.h>
 #define PVZ2_HAVE_MACH_VM 1
 #endif
@@ -2832,8 +2832,8 @@ static volatile uintptr_t g_guest_fault_addr;
 static void guest_guard_enter(void);
 static void guest_guard_leave(void);
 /* Reading the guest's memory without the risk of a fault: on the Mac through
- * the kernel. On iOS guest_read is a stub (mach_vm is not available there);
- * callers that must work on iOS read the process's own memory directly, which
+ * the kernel (mach_vm on the Mac, vm_read_overwrite on iOS). Some callers read
+ * the process's own memory directly instead (guest_read_bytes on iOS), which
  * is safe only for addresses the guest has just given us. */
 static bool guest_read(uint64_t addr, void *out, size_t size);
 
@@ -4051,6 +4051,24 @@ static atomic_int g_finder_running;
  * a line in the log, and at sixty frames a second that is a flood. */
 static double g_last_tell;
 
+#ifndef PVZ2_HAVE_MACH_VM
+/* Is this the guest's app object? The hosts without the Mac's search (Windows
+ * and iOS) check a candidate with it: the screen size it holds must be the one
+ * looked for, and its app height must be the design height, which is the
+ * guest's own invariant. */
+static bool guest_app_looks_right(uint64_t app, uint64_t screen_pair)
+{
+    uint64_t pair = 0;
+    int32_t size[2] = { 0, 0 };
+    float design_h = 0.0f;
+    if (!guest_read(app + 0x86c, &pair, sizeof pair) || pair != screen_pair) return false;
+    if (!guest_read(app + 0xf4, size, sizeof size)) return false;
+    if (size[0] <= 0 || size[1] <= 0 || size[0] > 100000 || size[1] > 100000) return false;
+    if (!guest_read(app + 0x9c4, &design_h, sizeof design_h)) return false;
+    return design_h > 1.0f && design_h < 100000.0f && size[1] == (int)design_h;
+}
+#endif
+
 /* Read a word out of the guest's memory without the risk of a fault: the
  * kernel says "not readable" instead of killing the process. */
 #ifdef PVZ2_HAVE_MACH_VM
@@ -4192,18 +4210,6 @@ static bool guest_read(uint64_t addr, void *out, size_t size)
                              out, size, &got) && got == size;
 }
 
-static bool guest_app_looks_right(uint64_t app, uint64_t screen_pair)
-{
-    uint64_t pair = 0;
-    int32_t size[2] = { 0, 0 };
-    float design_h = 0.0f;
-    if (!guest_read(app + 0x86c, &pair, sizeof pair) || pair != screen_pair) return false;
-    if (!guest_read(app + 0xf4, size, sizeof size)) return false;
-    if (size[0] <= 0 || size[1] <= 0 || size[0] > 100000 || size[1] > 100000) return false;
-    if (!guest_read(app + 0x9c4, &design_h, sizeof design_h)) return false;
-    return design_h > 1.0f && design_h < 100000.0f && size[1] == (int)design_h;
-}
-
 static uint64_t guest_app_find(int start_w, int start_h, bool writable_only)
 {
     LARGE_INTEGER began, ended, freq;
@@ -4286,19 +4292,64 @@ static bool guest_write_u64(uint64_t addr, uint64_t value)
                                       &value, sizeof value, &wrote) &&
            wrote == sizeof value;
 }
-#else /* not iOS: the guest's app object cannot be found there */
-/* The mach_vm calls do not exist on iOS (mach_vm.h says so), so the app
- * object's address cannot be found and the screen size cannot be written into
- * it. That is no loss on the iPad: its surface is the game's own size for
- * ever, so there is never a new size to tell the guest about. */
+#else /* iOS */
+/* The mach_vm calls do not exist on iOS (mach_vm.h says so), but the older
+ * vm_read_overwrite and vm_write do, and on the app's own task they read and
+ * write without the risk of a fault, as on the Mac. A phone needs them: a
+ * phone that folds (the iPhone Duo) moves the game to a screen of another
+ * size, and the guest has to be told the new size in its app object, or it
+ * keeps drawing the old shape inside the new surface. */
 static bool guest_read(uint64_t addr, void *out, size_t size)
-{ (void)addr; (void)out; (void)size; return false; }
+{
+    vm_size_t got = 0;
+    return addr && out && size &&
+           vm_read_overwrite(mach_task_self(), (vm_address_t)addr, (vm_size_t)size,
+                             (vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS &&
+           got == size;
+}
+
+/* No search: the guest's own globals lead to the object. The app getter's GOT
+ * slot (0x2511918, the one the seed pick's getter reads) holds the address of
+ * the guest's app global, and that global holds the LawnApp: measured on the
+ * iPhone simulator, where it held 2853x2007 at +0x86c and +0x744, 2183x1536
+ * at +0xf4 and 1536.0 at +0x9c4. The driver's global (GUEST_DRIVER_GLOBAL, and
+ * the driver's +0x98) is tried after it; neither held the app there. A
+ * candidate is taken only if it holds the size looked for, as on the other
+ * hosts. */
 static uint64_t guest_app_find(int start_w, int start_h, bool writable_only)
-{ (void)start_w; (void)start_h; (void)writable_only; return 0; }
+{
+    (void)writable_only;
+    uint64_t packed = ((uint64_t)(uint32_t)start_w) | ((uint64_t)(uint32_t)start_h << 32);
+    uint64_t cand[3] = { 0, 0, 0 }, ptr = 0;
+    const char *from[3] = { "the app getter's GOT slot", "the driver's +0x98", "the driver's global" };
+    void *got = tl_aot_guest_data_ptr_any(0x2511918);
+    if (got && guest_read((uint64_t)(uintptr_t)got, &ptr, sizeof ptr) && ptr)
+        guest_read(ptr, &cand[0], sizeof cand[0]);
+    void *global = tl_aot_guest_data_ptr_any(0x25a4e50);   /* GUEST_DRIVER_GLOBAL, defined further down */
+    if (global && guest_read((uint64_t)(uintptr_t)global, &cand[2], sizeof cand[2]) && cand[2])
+        guest_read(cand[2] + 0x98, &cand[1], sizeof cand[1]);
+    for (int i = 0; i < 3; i++) {
+        if (cand[i] && guest_app_looks_right(cand[i], packed)) {
+            tl_log_line("pvz2: the guest's app object is %p (from %s)",
+                        (void *)(uintptr_t)cand[i], from[i]);
+            return cand[i];
+        }
+    }
+    tl_log_line("pvz2: the guest's app object was not found (%d x %d) through the guest's globals",
+                start_w, start_h);
+    return 0;
+}
+
 static bool guest_write_u32(uint64_t addr, int32_t value)
-{ (void)addr; (void)value; return false; }
+{
+    return addr && vm_write(mach_task_self(), (vm_address_t)addr,
+                            (vm_offset_t)&value, sizeof value) == KERN_SUCCESS;
+}
 static bool guest_write_u64(uint64_t addr, uint64_t value)
-{ (void)addr; (void)value; return false; }
+{
+    return addr && vm_write(mach_task_self(), (vm_address_t)addr,
+                            (vm_offset_t)&value, sizeof value) == KERN_SUCCESS;
+}
 #endif /* PVZ2_HAVE_MACH_VM */
 
 /* The thread that looks for it: the game must not stop while the memory is
@@ -4490,10 +4541,10 @@ static bool guest_anchored_rect_raw(void *widget, int *out)
  * The game's design size is the app's logical size (3339x1536 for this game),
  * and the surface is the app's size as the host told it (1748x804): the same
  * shape, so the scale is the surface's height over the design's height. The
- * design height is in the guest's own app object. On iOS there is no app
- * object (guest_read is a stub there), so the root widget gives the same
- * answer: UIScreen is the saved tree's root and its rect is the design size. */
-static void *g_screen_widget;   /* UIScreen, on iOS where the app object is not readable */
+ * design height is in the guest's own app object. Until that object is found
+ * (and wherever it is not), the root widget gives the same answer: UIScreen is
+ * the saved tree's root and its rect is the design size. */
+static void *g_screen_widget;   /* UIScreen, while the app object is not known */
 static uint64_t g_design_app;   /* the app object the cached design height belongs to */
 static float g_design_h;        /* its design height (1536): it does not change */
 
@@ -5192,8 +5243,8 @@ static void guest_cursor_update(void)
     if (board && pending && (g_cursor_kind == TL_PVZ2_CURSOR_PLANT || g_cursor_kind == TL_PVZ2_CURSOR_SHOVEL ||
                              g_cursor_kind == TL_PVZ2_CURSOR_PLANT_FOOD)) {
         uint64_t app = atomic_load(&g_app_object);
-        /* The mach_vm search that fills g_app_object runs on the Mac; Windows
-         * and iPad have none, and a Mac search may still be going. Their
+        /* The search that fills g_app_object runs on its own thread (on iOS it
+         * only follows the guest's globals), and it may still be going. The
          * driver's global is the LawnApp itself on some builds and the driver
          * that holds it at +0x98 on others, so both candidates are accepted
          * only when they have the app's own size and design height. */

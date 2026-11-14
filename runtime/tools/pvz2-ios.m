@@ -1863,9 +1863,10 @@ static void surface_follow_scene(void)
     int nw = (int)lround(long_pt * scale), nh = (int)lround(short_pt * scale);
     if (nw == g_w && nh == g_h) return;
     /* The game lays itself out for shapes from 4:3 to 21:9 (README); outside
-     * that it is better letterboxed at the size it has. */
+     * that it is better letterboxed at the size it has. The bounds are compared
+     * exactly, in whole pixels: a tolerance let 1333x1000 through. */
     double ratio = long_pt / short_pt;
-    if (ratio < 4.0 / 3.0 - 0.001 || ratio > 21.0 / 9.0 + 0.001) {
+    if (3LL * nw < 4LL * nh || 9LL * nw > 21LL * nh) {
         if (nw != g_follow_refused_w || nh != g_follow_refused_h) {
             g_follow_refused_w = nw; g_follow_refused_h = nh;
             tl_log_line("ios: the scene is %.0fx%.0f points (%.2f:1), outside 4:3 to 21:9; "
