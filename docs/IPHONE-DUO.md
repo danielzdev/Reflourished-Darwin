@@ -89,3 +89,23 @@ if the scene had settled at it. Screenshots of one screen: `xcrun simctl io <udi
 A wildcard development profile works with the app's own bundle ID. With `--obb` the game data is
 inside the app, so the first launch downloads nothing. The game's log is `Documents/pvz2.log` in
 the app's data container, and the session before it is `Documents/pvz2.previous.log`.
+
+## Keeping up with updates
+
+Two things are updated, on different clocks (as of 2026-11-14):
+
+- **The port** (upstream, `oenderg/Reflourished-Darwin`): six releases in its first three weeks.
+- **The game** (the mod itself): a new version every few months; 1.4.2 is from April 2026.
+
+A port update on this fork: merge upstream's `main` into this fork's `main`, build as above and
+install over the app on the phone. The app ID and the signing team stay the same, so the saved
+game stays. The fork's code is two commits in two files (`pvz2-ios.m`, and iOS-only code in
+`husk-tl-pvz2.c`); upstream changes the driver often, so a merge can conflict there.
+
+A new game version needs upstream to support it first ([NEW-GAME-VERSION.md](NEW-GAME-VERSION.md)).
+This fork adds one game address of its own to the list that must be found again when
+`libPVZ2.so` changes: the app getter's GOT slot that the iOS driver reads the app object from
+(`guest_app_find`). `libPVZ2.so` was identical between 1.4.0 and 1.4.2.
+
+If a merge is ever not worth it, upstream's own release fills whichever screen it is launched
+on; it only does not follow a fold in mid-game.
