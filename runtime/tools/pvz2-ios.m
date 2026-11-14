@@ -840,6 +840,7 @@ static int _lastSafe[2] = { -1, -1 };
 @end
 
 static void keyboard_install(UIView *view);
+static void surface_follow_scene_soon(void);
 
 /* The orientations the window may take. On the iPad the window follows the
  * device, like other iPad games: in portrait the game (which has no portrait
@@ -870,7 +871,11 @@ static UIInterfaceOrientationMask allowed_orientations(void)
     [(PVZ2View *)self.view updateViewport:"the window is turning"];
     [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> ctx) {
         [(PVZ2View *)self.view updateViewport:"the window is turning"];
-    } completion:nil];
+    } completion:^(id<UIViewControllerTransitionCoordinatorContext> ctx) {
+        (void)ctx;
+        /* The window has its new size: on a phone the surface may follow it. */
+        surface_follow_scene_soon();
+    }];
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
 /* The home indicator stays (dimmed): when it hides, the system ignores the
@@ -1796,6 +1801,109 @@ static NSDictionary *obb_info(void)
 
 #pragma mark - scene
 
+/* A phone's surface follows its screen.
+ *
+ * A phone with two screens (the iPhone Duo: the outer one folded, the inner
+ * one unfolded) moves the scene to a screen of another size when it folds or
+ * unfolds. A surface fixed at launch would then be scaled into the new screen
+ * with bars around it, so on a phone the guest is told the new size, and it
+ * lays itself out again for it, as the Mac host's Adapt mode does. The surface
+ * stays in landscape order (the long side first): the game has no portrait
+ * layout, so turning the unfolded phone upright changes no surface, and the
+ * game stays the landscape strip it is there.
+ *
+ * The iPad is left alone: its surface is the display's on purpose, and its
+ * free window only scales the picture (see willConnectToSession).
+ *
+ * The size is taken once the scene has settled -- half a second after the last
+ * change, and not while the system is still resizing it -- so a fold's
+ * animation gives the guest one new size and not a dozen. And never before
+ * the game has started: a new size then crashes it seconds later (AGENTS.md),
+ * so the size is held until tl_pvz2_started(). */
+static unsigned g_follow_generation;
+static int g_follow_held_w, g_follow_held_h;
+static int g_follow_refused_w, g_follow_refused_h;
+static void surface_follow_scene(void);
+
+static void surface_follow_scene_soon(void)
+{
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return;
+    unsigned generation = ++g_follow_generation;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(NSEC_PER_SEC / 2)),
+                   dispatch_get_main_queue(), ^{
+        /* A newer size arrived in the meantime: that one's own timer decides. */
+        if (generation != g_follow_generation) return;
+        surface_follow_scene();
+    });
+}
+
+static void surface_follow_scene(void)
+{
+    UIWindowScene *scene = g_scene;
+    PVZ2View *view = g_root_vc ? (PVZ2View *)g_root_vc.view : nil;
+    if (!scene || !view || g_w < 100 || g_h < 100) return;
+    if (@available(iOS 26.0, *)) {
+        if (scene.effectiveGeometry.isInteractivelyResizing) { surface_follow_scene_soon(); return; }
+    }
+    CGSize pts = scene.coordinateSpace.bounds.size;
+    /* A test can stand in for a fold, which no script can do in the simulator:
+     * launch with TL_PVZ2_TEST_SCENE=951x669 (points) and the surface follows
+     * that size as if the scene had settled at it. The window keeps its real
+     * size, so the picture is letterboxed by the difference. */
+    const char *test_scene = getenv("TL_PVZ2_TEST_SCENE");
+    double tw = 0, th = 0;
+    if (test_scene && sscanf(test_scene, "%lfx%lf", &tw, &th) == 2 && tw > 0 && th > 0)
+        pts = CGSizeMake(tw, th);
+    /* The scene's own screen's scale: the phone has two screens, and the main
+     * one is the outer, whatever screen the scene is on now. */
+    CGFloat scale = scene.traitCollection.displayScale;
+    if (scale <= 0) scale = scene.screen.scale;
+    double long_pt = MAX(pts.width, pts.height), short_pt = MIN(pts.width, pts.height);
+    if (scale <= 0 || short_pt <= 0) return;
+    int nw = (int)lround(long_pt * scale), nh = (int)lround(short_pt * scale);
+    if (nw == g_w && nh == g_h) return;
+    /* The game lays itself out for shapes from 4:3 to 21:9 (README); outside
+     * that it is better letterboxed at the size it has. */
+    double ratio = long_pt / short_pt;
+    if (ratio < 4.0 / 3.0 - 0.001 || ratio > 21.0 / 9.0 + 0.001) {
+        if (nw != g_follow_refused_w || nh != g_follow_refused_h) {
+            g_follow_refused_w = nw; g_follow_refused_h = nh;
+            tl_log_line("ios: the scene is %.0fx%.0f points (%.2f:1), outside 4:3 to 21:9; "
+                        "the surface stays %dx%d", pts.width, pts.height, ratio, g_w, g_h);
+        }
+        return;
+    }
+    if (!tl_pvz2_started()) {
+        if (nw != g_follow_held_w || nh != g_follow_held_h) {
+            g_follow_held_w = nw; g_follow_held_h = nh;
+            tl_log_line("ios: the scene is %.0fx%.0f points; the surface stays %dx%d "
+                        "until the game has started, then becomes %dx%d",
+                        pts.width, pts.height, g_w, g_h, nw, nh);
+        }
+        surface_follow_scene_soon();
+        return;
+    }
+    tl_log_line("ios: the surface is now %dx%d (it was %dx%d): the scene settled at %.0fx%.0f "
+                "points at %.1fx%s", nw, nh, g_w, g_h, pts.width, pts.height, scale,
+                g_follow_held_w ? ", held until the game had started" : "");
+    g_follow_held_w = g_follow_held_h = 0;
+    g_w = nw; g_h = nh;
+    /* The driver makes the change on the game's own thread, between frames. */
+    tl_pvz2_set_surface_size(g_w, g_h);
+    /* The viewport, the cutout and the full geometry line are measured again
+     * against the new surface, and logged even if their numbers repeat. One
+     * transaction around it all: the viewport's own commit would otherwise lay
+     * the view out at once, and the log would give the layout's reason. */
+    [CATransaction begin];
+    view.metal.contentsScale = scale;
+    _lastViewport = CGRectZero;
+    _lastSafe[0] = _lastSafe[1] = -1;
+    [view updateViewport:"the surface follows the screen"];
+    [view updateSafeInsets];
+    [view setNeedsLayout];
+    [CATransaction commit];
+}
+
 @interface PVZ2SceneDelegate : UIResponder <UIWindowSceneDelegate>
 @property(nonatomic, strong) UIWindow *window;
 - (void)watchOrientation;
@@ -1887,6 +1995,9 @@ static NSDictionary *obb_info(void)
             tl_pvz2_set_surface_size(g_w, g_h);
         }
     }
+    /* A phone folded or unfolded: the surface follows the new screen once it
+     * has settled (surface_follow_scene). */
+    surface_follow_scene_soon();
 }
 
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)options
