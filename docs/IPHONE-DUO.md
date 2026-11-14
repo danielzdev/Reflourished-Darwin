@@ -109,3 +109,22 @@ This fork adds one game address of its own to the list that must be found again 
 
 If a merge is ever not worth it, upstream's own release fills whichever screen it is launched
 on; it only does not follow a fold in mid-game.
+
+## Keeping the save in step with a Mac
+
+The progress is one file, `pp.dat`, in
+`<data>/sdcard/Android/data/com.ea.game.pvz2_rfl/files/No_Backup/` (the game also keeps
+`pp.dat.bak` and falls back to it). `<data>` is `Documents/data` in the iOS app's container and
+`~/Library/Application Support/PvZ2 Reflourished` on the Mac. Measured on 2026-11-14:
+
+- A phone's `pp.dat` copied to the Mac as `pp.dat` and `pp.dat.bak`, with the game closed, loads
+  there: same profile, level and coins. The game does not rewrite the file unless progress is made.
+- A save dropped in as `pp.dat.imported` (what Import Save does) loads too, but the game consumes
+  it and writes no `pp.dat` until progress is made, so a copy as `pp.dat` is the safer way.
+- A Mac can read and write the files of a development-signed iOS app over Wi-Fi:
+  `xcrun devicectl device copy from|to --domain-type appDataContainer --domain-identifier <app id>`.
+  A request fails now and then and works on the next try.
+- A whole `pp.dat` starts with `RTON` and ends with `DONE`.
+
+A small script outside this repository uses this to sync before and after a Mac session. Not yet
+checked: the phone loading a save that the Mac changed. Quests live in other files.
